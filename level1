@@ -1,0 +1,111 @@
+import numpy as np
+import pandas as pd
+
+from scipy.signal import welch
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+
+import tensorflow as tf
+from tensorflow.keras.layers import (
+    Input, Conv1D, MaxPooling1D,
+    GlobalAveragePooling1D, Dense,
+    Concatenate, BatchNormalization
+)
+from tensorflow.keras.models import Model
+
+data = pd.read_csv("eeg_data_cleaned.csv")
+
+channels = [
+    "FP1-F7","F7-T7","T7-P7","P7-O1",
+    "FP1-F3","F3-C3","C3-P3","P3-O1",
+    "FP2-F4","F4-C4","C4-P4","P4-O2",
+    "FP2-F8","F8-T8","T8-P8-0","P8-O2",
+    "FZ-CZ","CZ-PZ","P7-T7","T7-FT9",
+    "FT9-FT10","FT10-T8","T8-P8-1"
+
+]
+
+X_raw = data[channels].values
+
+WINDOW_SIZE = 256
+STEP = 128
+
+def create_windows(X):
+    windows = []
+    for start in range(0, len(X) - WINDOW_SIZE, STEP):
+        windows.append(X[start:start + WINDOW_SIZE])
+    return np.array(windows)
+
+X = create_windows(X_raw)
+
+#////X → (num_windows, 256, 23)
+
+def bandpower(signal, fs, low, high):
+    freqs, psd = welch(signal, fs=fs)
+    idx = (freqs >= low) & (freqs <= high)
+    return np.sum(psd[idx])
+
+def extract_features(window, fs=256):
+    features = []
+    for ch in range(window.shape[1]):
+        sig = window[:, ch]
+        features.extend([
+            sig.mean(),
+            sig.std(),
+            bandpower(sig, fs, 0.5, 4),   # Delta
+            bandpower(sig, fs, 4, 8),     # Theta
+            bandpower(sig, fs, 8, 13),    # Alpha
+            bandpower(sig, fs, 13, 30)    # Beta
+        ])
+    return features
+
+X_feat = np.array([extract_features(w) for w in X])
+
+num_samples = X.shape[0]
+y = np.random.randint(0, 2, size=num_samples)
+
+scaler = StandardScaler()
+X_feat = scaler.fit_transform(X_feat)
+
+X = (X - X.mean()) / X.std()
+
+X_train, X_test, Xf_train, Xf_test, y_train, y_test = train_test_split(
+    X, X_feat, y,
+    test_size=0.2,
+    random_state=42
+)
+eeg_input = Input(shape=(256, 23))
+
+x = Conv1D(64, 5, activation='relu')(eeg_input)
+x = BatchNormalization()(x)
+x = MaxPooling1D(2)(x)
+
+x = Conv1D(128, 3, activation='relu')(x)
+x = GlobalAveragePooling1D()(x)
+
+feat_input = Input(shape=(138,))
+y_feat = Dense(64, activation='relu')(feat_input)
+
+combined = Concatenate()([x, y_feat])
+z = Dense(64, activation='relu')(combined)
+output = Dense(2, activation='softmax')(z)
+
+model = Model(inputs=[eeg_input, feat_input], outputs=output)
+model.compile(
+    optimizer='adam',
+    loss='sparse_categorical_crossentropy',
+    metrics=['accuracy']
+)
+
+model.summary()
+
+history = model.fit(
+    [X_train, Xf_train], y_train,
+    epochs=20,
+    batch_size=32,
+    validation_split=0.2
+)
+loss, acc = model.evaluate([X_test, Xf_test], y_test)
+print("Test Accuracy:", acc)
+model.save("eeg_hybrid_model.h5")
+
